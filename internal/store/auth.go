@@ -32,23 +32,19 @@ func (db *Database) Bootstrap(ctx context.Context) error {
 }
 
 func (db *Database) Login(ctx context.Context, email, password string, now time.Time, ttl time.Duration) (string, auth.Session, error) {
-	var user auth.User
-	err := db.Pool.QueryRow(ctx, `SELECT id,tenant_id,email,password_hash,role,disabled,version FROM users WHERE email=$1`, email).Scan(&user.ID, &user.TenantID, &user.Email, &user.PasswordHash, &user.Role, &user.Disabled, &user.Version)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", auth.Session{}, domain.ErrForbidden
-	}
+	service, err := auth.NewLoginService(loginRepository{pool: db.Pool}, auth.PasswordVerifierFunc(func(ctx context.Context, hash, candidate string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := auth.VerifyPassword(hash, candidate); err != nil {
+			return err
+		}
+		return ctx.Err()
+	}), auth.LoginObserverFunc(func(string, auth.LoginOutcome) {}))
 	if err != nil {
 		return "", auth.Session{}, err
 	}
-	if err := auth.VerifyPassword(user.PasswordHash, password); err != nil || user.Disabled {
-		return "", auth.Session{}, domain.ErrForbidden
-	}
-	session, token, err := auth.NewSession(user, now, ttl)
-	if err != nil {
-		return "", auth.Session{}, err
-	}
-	_, err = db.Pool.Exec(ctx, `INSERT INTO sessions(id,user_id,tenant_id,role,token_hash,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, session.ID, session.UserID, session.TenantID, session.Role, session.TokenHash, session.CreatedAt, session.ExpiresAt)
-	return token, session, err
+	return service.Login(ctx, email, password, now, ttl)
 }
 
 func (db *Database) Authenticate(ctx context.Context, token string, now time.Time) (auth.User, auth.Session, error) {
