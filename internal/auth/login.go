@@ -81,11 +81,12 @@ func (service *LoginService) Login(ctx context.Context, email, password string, 
 	}
 
 	// Password hashing cannot always be interrupted, so login completion runs
-	// outside the HTTP handler while retaining request-scoped values.
-	workContext := context.WithoutCancel(ctx)
+	// outside the HTTP handler while retaining request-scoped values. The
+	// original context is still consulted before a session is issued so that a
+	// cancelled login never persists a token the caller cannot receive.
 	result := make(chan loginResult, 1)
 	go func() {
-		result <- service.completeLogin(workContext, email, password, now, ttl)
+		result <- service.completeLogin(ctx, email, password, now, ttl)
 	}()
 	select {
 	case <-ctx.Done():
@@ -99,7 +100,13 @@ func (service *LoginService) completeLogin(ctx context.Context, email, password 
 	outcome := LoginFailed
 	defer func() { service.observer.Finished(email, outcome) }()
 
-	user, err := service.repository.FindUserByEmail(ctx, email)
+	// The lookup and password check run on a context that survives request
+	// cancellation, because bcrypt may still be in flight when the caller
+	// disconnects. It must not, however, persist a session for a login the
+	// caller has already abandoned.
+	workContext := context.WithoutCancel(ctx)
+
+	user, err := service.repository.FindUserByEmail(workContext, email)
 	if err != nil {
 		return loginResult{err: err}
 	}
@@ -107,10 +114,17 @@ func (service *LoginService) completeLogin(ctx context.Context, email, password 
 		outcome = LoginForbidden
 		return loginResult{err: domain.ErrForbidden}
 	}
-	if err := service.verifier.Verify(ctx, user.PasswordHash, password); err != nil {
+	if err := service.verifier.Verify(workContext, user.PasswordHash, password); err != nil {
 		if errors.Is(err, domain.ErrForbidden) {
 			outcome = LoginForbidden
 		}
+		return loginResult{err: err}
+	}
+
+	// If the request was cancelled while password verification was in flight,
+	// stop here: the caller will never receive the token, so persisting the
+	// session would create an unrevocable online session in the background.
+	if err := ctx.Err(); err != nil {
 		return loginResult{err: err}
 	}
 
@@ -118,7 +132,7 @@ func (service *LoginService) completeLogin(ctx context.Context, email, password 
 	if err != nil {
 		return loginResult{err: err}
 	}
-	if err := service.repository.CreateSession(ctx, session); err != nil {
+	if err := service.repository.CreateSession(workContext, session); err != nil {
 		return loginResult{err: err}
 	}
 	outcome = LoginSucceeded
